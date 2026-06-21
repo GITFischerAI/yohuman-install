@@ -9,7 +9,16 @@
 set -euo pipefail
 
 CH="${YH_CHANNEL:-}"
-[ -n "$CH" ] || { echo "❌ Missing YH_CHANNEL (your Yo Human channel code)."; exit 1; }
+# Reuse the existing channel if already set up; else generate one (so the user never has to invent a code).
+if [ -z "$CH" ] && [ -f "$HOME/.yohuman-cowork/channel" ]; then CH="$(cat "$HOME/.yohuman-cowork/channel" 2>/dev/null)"; fi
+if [ -z "$CH" ]; then
+  set +o pipefail
+  CODE="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 10)"
+  set -o pipefail
+  [ -n "$CODE" ] || CODE="$(date +%s)$$"
+  CH="yohuman-cw-$CODE"
+fi
+mkdir -p "$HOME/.yohuman-cowork"; printf '%s' "$CH" > "$HOME/.yohuman-cowork/channel"
 # Public Yo Human backend (publishable key only — browser-safe, RLS-protected).
 PUSH_URL="${YH_PUSH_URL:-https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push}"
 PUSH_KEY="${YH_PUSH_KEY:-sb_publishable_hdgb0arXA-MlSIdTn-aRfQ_vL_XG-g1}"

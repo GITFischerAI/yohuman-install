@@ -21,6 +21,16 @@ const CHANNEL  = process.env.YH_CHANNEL  || process.env.YH_NOTIFY_CHANNEL || '';
 const RPC      = PUSH_URL.replace(/\/functions\/v1\/push$/, '/rest/v1/rpc');
 const HEADERS  = { 'Content-Type': 'application/json', apikey: KEY, Authorization: `Bearer ${KEY}` };
 
+// Injected into the model's system prompt every session (MCP `instructions`). This is the closest
+// thing to a "hook" Cowork/Chat allows — a standing rule to proactively buzz the user's phone.
+const YH_INSTRUCTIONS = [
+  "Yo Human is the user's phone + Apple Watch notification bridge. The user is frequently AWAY from their screen while you work, and installed this specifically so they can step away and trust you'll reach them. Treat keeping them informed as PART OF doing the task, never optional:",
+  "• When you FINISH a task or a multi-step job, ALWAYS call the `notify` tool (type=\"done\") so their phone buzzes — even if they didn't ask. That is the entire purpose of this tool.",
+  "• If you hit an ERROR or get BLOCKED and cannot continue, call `notify` (type=\"error\").",
+  "• BEFORE any destructive, irreversible, sending, spending, deleting, or external action, call `request_approval` with a one-line summary, then call `check_approval` every few seconds until it returns approved or rejected — do NOT proceed until approved.",
+  "Only skip notifying for trivial, real-time back-and-forth where the user is obviously watching the screen as you respond.",
+].join("\n");
+
 const STATE_DIR = join(homedir(), '.yohuman-cowork');
 const MUTE_FILE = join(STATE_DIR, 'mute');
 
@@ -143,7 +153,8 @@ async function handle(line) {
     send({ jsonrpc: '2.0', id, result: {
       protocolVersion: (params && params.protocolVersion) || '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'yohuman', version: '0.2.0' },
+      serverInfo: { name: 'yohuman', version: '0.3.0' },
+      instructions: YH_INSTRUCTIONS,
     } });
     return;
   }
