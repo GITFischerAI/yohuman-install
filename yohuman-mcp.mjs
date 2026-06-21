@@ -42,9 +42,9 @@ function setMuteLocal(on) {
 }
 
 // ---- Supabase backend (push function + decision RPCs) ----
-async function pushSend({ title, body, category = 'INFO', request_id }) {
+async function pushSend({ title, body, category = 'INFO', request_id, source = 'cowork' }) {
   if (!CHANNEL) return { ok: false, reason: 'No channel configured (set YH_CHANNEL to your app pairing code).' };
-  const payload = { channel: CHANNEL, title, body, category };
+  const payload = { channel: CHANNEL, title, body, category, source };
   if (request_id) payload.request_id = request_id;
   try {
     const res = await fetch(PUSH_URL, { method: 'POST', headers: HEADERS, body: JSON.stringify(payload) });
