@@ -53,6 +53,8 @@ if [ -z "$CHANNEL" ] && [ -f "$YH/config.sh" ]; then
   # shellcheck disable=SC1090
   . "$YH/config.sh" 2>/dev/null || true; CHANNEL="${YH_PUSH_CHANNEL:-}"
 fi
+# Reuse the Cowork channel if that was set up first — one phone code covers BOTH surfaces.
+if [ -z "$CHANNEL" ] && [ -f "$HOME/.yohuman-cowork/channel" ]; then CHANNEL="$(cat "$HOME/.yohuman-cowork/channel" 2>/dev/null)"; fi
 if [ -z "$CHANNEL" ]; then
   set +o pipefail
   CODE="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"

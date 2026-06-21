@@ -11,6 +11,8 @@ set -euo pipefail
 CH="${YH_CHANNEL:-}"
 # Reuse the existing channel if already set up; else generate one (so the user never has to invent a code).
 if [ -z "$CH" ] && [ -f "$HOME/.yohuman-cowork/channel" ]; then CH="$(cat "$HOME/.yohuman-cowork/channel" 2>/dev/null)"; fi
+# Reuse the Claude Code channel if that was set up first — one phone code covers BOTH surfaces.
+if [ -z "$CH" ] && [ -f "$HOME/.yohuman/config.sh" ]; then . "$HOME/.yohuman/config.sh" 2>/dev/null || true; CH="${YH_PUSH_CHANNEL:-}"; fi
 if [ -z "$CH" ]; then
   set +o pipefail
   CODE="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 10)"
