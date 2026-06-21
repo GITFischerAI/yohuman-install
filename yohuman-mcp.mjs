@@ -1,94 +1,81 @@
 #!/usr/bin/env node
-// Yo Human — Claude Desktop / Cowork MCP plug-in (Phase 0+).
+// Yo Human — Claude Desktop / Cowork MCP plug-in.
 // Zero dependencies. Speaks MCP over newline-delimited JSON-RPC on stdio.
-// Reuses our existing ntfy backend: notifications go to the user's phone; two-way
-// approvals use a non-blocking POLL pattern (fire alert -> check_approval until decided)
-// to stay under Claude Desktop's ~60s tool-call timeout.
+//
+// Delivery: Supabase `push` function → Apple Push (APNs) → the Yo Human iOS app.
+// (No ntfy.) Two-way approvals use a non-blocking POLL pattern (request_approval ->
+// check_approval until decided) to stay under Claude Desktop's ~60s tool-call timeout.
 //
 // Config via env (set in the Desktop Extension / claude_desktop_config.json):
-//   YH_NTFY_SERVER     (default https://ntfy.sh)
-//   YH_NOTIFY_CHANNEL  (the topic the user's phone is subscribed to)
-//   YH_COMMAND_CHANNEL (the private topic the Allow/Reject buttons post to)
+//   YH_CHANNEL   — the channel code you paste into the Yo Human app (required)
+//   YH_PUSH_URL  — default https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push
+//   YH_PUSH_KEY  — Supabase publishable key (browser-safe, RLS-protected)
 
 import { writeFileSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-const NTFY   = process.env.YH_NTFY_SERVER    || 'https://ntfy.sh';
-const NOTIFY = process.env.YH_NOTIFY_CHANNEL  || '';
-const CMD    = process.env.YH_COMMAND_CHANNEL || '';
+const PUSH_URL = process.env.YH_PUSH_URL || 'https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push';
+const KEY      = process.env.YH_PUSH_KEY || 'sb_publishable_hdgb0arXA-MlSIdTn-aRfQ_vL_XG-g1';
+const CHANNEL  = process.env.YH_CHANNEL  || process.env.YH_NOTIFY_CHANNEL || '';
+const RPC      = PUSH_URL.replace(/\/functions\/v1\/push$/, '/rest/v1/rpc');
+const HEADERS  = { 'Content-Type': 'application/json', apikey: KEY, Authorization: `Bearer ${KEY}` };
 
 const STATE_DIR = join(homedir(), '.yohuman-cowork');
 const MUTE_FILE = join(STATE_DIR, 'mute');
 
 const isMuted = () => existsSync(MUTE_FILE);
-function setMute(on) {
+function setMuteLocal(on) {
   try { mkdirSync(STATE_DIR, { recursive: true }); } catch {}
   if (on) writeFileSync(MUTE_FILE, String(Date.now()));
   else if (existsSync(MUTE_FILE)) rmSync(MUTE_FILE);
 }
 
-async function ntfyPost(channel, body, headers) {
+// ---- Supabase backend (push function + decision RPCs) ----
+async function pushSend({ title, body, category = 'INFO', request_id }) {
+  if (!CHANNEL) return { ok: false, reason: 'No channel configured (set YH_CHANNEL to your app pairing code).' };
+  const payload = { channel: CHANNEL, title, body, category };
+  if (request_id) payload.request_id = request_id;
   try {
-    const res = await fetch(`${NTFY}/${channel}`, { method: 'POST', headers, body });
-    return res.ok;
-  } catch { return false; }
+    const res = await fetch(PUSH_URL, { method: 'POST', headers: HEADERS, body: JSON.stringify(payload) });
+    return { ok: res.ok };
+  } catch { return { ok: false, reason: 'network error' }; }
 }
 
-// ---- notification helpers (the ntfy backend, wrapped as plug-in actions) ----
+async function getDecision(requestId) {
+  try {
+    const res = await fetch(`${RPC}/get_decision`, { method: 'POST', headers: HEADERS, body: JSON.stringify({ p_request_id: String(requestId) }) });
+    if (!res.ok) return '';
+    const t = (await res.text()).replace(/["\s[\]]/g, '');
+    return ['allowonce', 'allowalways', 'reject'].includes(t) ? t : '';
+  } catch { return ''; }
+}
+
+// Server-side channel mute so EVERY agent on this channel goes quiet (honored by the push fn).
+async function setMuteServer(muted) {
+  if (!CHANNEL) return;
+  try { await fetch(`${RPC}/set_channel_mute`, { method: 'POST', headers: HEADERS, body: JSON.stringify({ p_channel: CHANNEL, p_muted: muted }) }); } catch {}
+}
+
+// ---- notification helpers (wrapped as plug-in actions) ----
 async function sendNotify(message, type) {
-  if (!NOTIFY) return { ok: false, reason: 'No notify channel configured (set YH_NOTIFY_CHANNEL).' };
+  if (!CHANNEL) return { ok: false, reason: 'No channel configured (set YH_CHANNEL).' };
   if (isMuted()) return { ok: true, muted: true };
-  // NOTE: Title is an HTTP header → must be plain ASCII (no em dashes / emoji). Emoji is fine in the body.
-  const map = {
-    done:  ['Yo Human - done',  'white_check_mark', 'default'],
-    error: ['Yo Human - error', 'rotating_light',   'high'],
-    info:  ['Yo Human',         'speech_balloon',   'default'],
-  };
-  const [title, tag, prio] = map[type] || map.info;
-  const ok = await ntfyPost(NOTIFY, message, { Title: title, Tags: tag, Priority: prio });
-  return { ok };
+  const titles = { done: 'Yo Human — done', error: 'Yo Human — error', info: 'Yo Human' };
+  return pushSend({ title: titles[type] || titles.info, body: message, category: 'INFO' });
 }
 
 async function sendApproval(summary) {
-  if (!NOTIFY || !CMD) return { ok: false, reason: 'Channels not configured (need YH_NOTIFY_CHANNEL + YH_COMMAND_CHANNEL).' };
-  const token = String(Math.floor(Date.now() / 1000));
+  const token = `cowork-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  if (!CHANNEL) return { ok: false, reason: 'No channel configured (set YH_CHANNEL).' };
   if (isMuted()) return { ok: true, muted: true, token };
-  const cmdUrl = `${NTFY}/${CMD}`;
-  const actions =
-    `http, Allow once, ${cmdUrl}, method=POST, body=allowonce, clear=true; ` +
-    `http, Allow always, ${cmdUrl}, method=POST, body=allowalways, clear=true; ` +
-    `http, Reject, ${cmdUrl}, method=POST, body=reject, clear=true`;
-  const ok = await ntfyPost(NOTIFY, `🔐 ${summary}`, {
-    Title: 'Approve in Cowork?', Priority: 'max', Tags: 'lock', Actions: actions,
-  });
-  return { ok, token };
+  const r = await pushSend({ title: 'Approve in Cowork?', body: summary, category: 'APPROVAL', request_id: token });
+  return { ok: r.ok, token, reason: r.reason };
 }
 
 async function checkApproval(token) {
-  if (!CMD) return { status: 'error', reason: 'No command channel configured.' };
-  let text = '';
-  try {
-    // poll=1 returns cached messages since `token` and closes immediately (non-blocking).
-    const res = await fetch(`${NTFY}/${CMD}/json?since=${encodeURIComponent(String(token))}&poll=1`);
-    if (!res.ok) return { status: 'pending' };
-    text = await res.text();
-  } catch { return { status: 'pending' }; }
-
-  let decision = '';
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const o = JSON.parse(line);
-      if (o.event === 'message' && ['allowonce', 'allowalways', 'reject'].includes(o.message)) decision = o.message;
-    } catch {}
-  }
+  const decision = await getDecision(token);
   if (!decision) return { status: 'pending' };
-
-  const friendly = decision === 'allowonce'   ? '✅ Got it — allowing once. Proceeding.'
-                 : decision === 'allowalways' ? "✅ Got it — allowing always. Won't ask again."
-                 :                              '🚫 Got it — rejected. Stopping.';
-  await ntfyPost(NOTIFY, friendly, { Title: 'Yo Human', Tags: 'white_check_mark', Priority: 'low' });
   return { status: decision === 'reject' ? 'rejected' : 'approved', decision };
 }
 
@@ -138,8 +125,8 @@ async function callTool(name, args) {
     }
     case 'check_approval':
       return JSON.stringify(await checkApproval(args.token));
-    case 'mute':   setMute(true);  return 'Muted. The phone will stay quiet until you unmute.';
-    case 'unmute': setMute(false); return 'Unmuted. Notifications resume.';
+    case 'mute':   setMuteLocal(true);  await setMuteServer(true);  return 'Muted. The phone will stay quiet until you unmute.';
+    case 'unmute': setMuteLocal(false); await setMuteServer(false); return 'Unmuted. Notifications resume.';
     default: return `Unknown tool: ${name}`;
   }
 }
@@ -156,7 +143,7 @@ async function handle(line) {
     send({ jsonrpc: '2.0', id, result: {
       protocolVersion: (params && params.protocolVersion) || '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'yohuman', version: '0.1.0' },
+      serverInfo: { name: 'yohuman', version: '0.2.0' },
     } });
     return;
   }

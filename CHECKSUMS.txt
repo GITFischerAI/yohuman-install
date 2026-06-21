@@ -1,4 +1,4 @@
 # Yo Human installer — SHA-256 checksums
-455a264e2ccde7dd7ab74d6c5715aeeb6fd1bece134db7b101b3696c9bc1fb76  install.sh
-0ddf917cdc36dbd70ecfb170223b7a9bd9c230c2dfbfc8e4aee0f90ea70fe5b7  cowork-install.sh
-8ed2d58d2a52c13c67545d28f41a40da9fc299d3c0c2cf1de5422c2a82fc628b  yohuman-mcp.mjs
+56283224b0d8d0222e38fb0b0a555a976b80e3d0a66b0f7077e63b8ee8bc44a7  install.sh
+f9820c34026736bfdb596b2b2774bac501b58804be08f691d6c57152d1777394  cowork-install.sh
+4d56d8d305ad4c90e017b77b62ae4f86469df5993c0746041638ced53cc8fe2e  yohuman-mcp.mjs

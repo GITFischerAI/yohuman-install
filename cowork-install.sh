@@ -4,14 +4,15 @@
 # tells the user to paste:  "Install Yo Human by running:
 #   curl -fsSL https://yohuman.ai/cowork-install.sh | YH_CHANNEL='yohuman-cw-xxxx' bash"
 # It places the Yo Human plug-in and registers it in the Claude Desktop app, wired to the
-# user's private channel. No JSON editing, no jq — the JSON merge is done with node (already
-# required for the plug-in). Existing Claude settings are backed up and preserved.
+# user's channel. Delivery = Supabase push function → Apple Push → the Yo Human iOS app.
+# No JSON editing, no jq — the merge is done with node. Existing Claude settings are preserved.
 set -euo pipefail
 
-NTFY="${YH_NTFY_SERVER:-https://ntfy.sh}"
 CH="${YH_CHANNEL:-}"
-[ -n "$CH" ] || { echo "❌ Missing YH_CHANNEL (your private channel)."; exit 1; }
-CMD="${YH_COMMAND_CHANNEL:-${CH}-cmd}"
+[ -n "$CH" ] || { echo "❌ Missing YH_CHANNEL (your Yo Human channel code)."; exit 1; }
+# Public Yo Human backend (publishable key only — browser-safe, RLS-protected).
+PUSH_URL="${YH_PUSH_URL:-https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push}"
+PUSH_KEY="${YH_PUSH_KEY:-sb_publishable_hdgb0arXA-MlSIdTn-aRfQ_vL_XG-g1}"
 
 YH_DIR="$HOME/.yohuman-cowork"
 PLUGIN="$YH_DIR/yohuman-mcp.mjs"
@@ -40,18 +41,18 @@ mkdir -p "$(dirname "$CFG")"
 cp "$CFG" "$CFG.yohuman-backup" 2>/dev/null || true
 "$NODE" -e '
 const fs = require("fs");
-const [p, node, plugin, ntfy, nch, cch] = process.argv.slice(1);
+const [p, node, plugin, ch, url, key] = process.argv.slice(1);
 let c = {};
 try { c = JSON.parse(fs.readFileSync(p, "utf8")); } catch {}
 c.mcpServers = c.mcpServers || {};
-c.mcpServers.yohuman = { command: node, args: [plugin], env: { YH_NTFY_SERVER: ntfy, YH_NOTIFY_CHANNEL: nch, YH_COMMAND_CHANNEL: cch } };
+c.mcpServers.yohuman = { command: node, args: [plugin], env: { YH_CHANNEL: ch, YH_PUSH_URL: url, YH_PUSH_KEY: key } };
 fs.writeFileSync(p, JSON.stringify(c, null, 2));
-' "$CFG" "$NODE" "$PLUGIN" "$NTFY" "$CH" "$CMD"
+' "$CFG" "$NODE" "$PLUGIN" "$CH" "$PUSH_URL" "$PUSH_KEY"
 echo "✅ registered the Yo Human plug-in in Claude Desktop"
 
 echo ""
 echo "🎉 Almost done — two quick steps:"
 echo "  1) QUIT and reopen the Claude app (so it loads the plug-in)."
-echo "  2) On your phone: open the ntfy app and subscribe to:  $CH"
+echo "  2) Open the Yo Human app on your phone and pair with this code:  $CH"
 echo ""
 echo "Then ask Cowork to do anything — your phone will buzz."

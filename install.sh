@@ -2,19 +2,27 @@
 # install-yohuman.sh — set up Yo Human on ANY Mac, for EVERY Claude Code project.
 #
 # Installs global Claude Code hooks so every terminal Claude Code session on this
-# machine notifies your iPhone (via the ntfy app), plus the opt-in two-way
-# phone-approval scripts. Copy this one file to another Mac and run it.
+# machine buzzes your iPhone through the **Yo Human app** (Supabase push → Apple Push),
+# plus the opt-in two-way phone-approval (Allow / Reject right from your phone).
+# Copy this one file to another Mac and run it.
+#
+# Delivery path: Claude hook → Supabase `push` function → APNs → Yo Human iOS app.
+# (No ntfy. The channel code this prints is what you paste into the app to pair.)
 #
 # Usage:
-#   YH_NOTIFY="your-ntfy-channel" bash install-yohuman.sh
-#   (or just run it and it will ask for your notify channel)
+#   bash install-yohuman.sh                 # generates a channel code for you
+#   YH_CHANNEL="my-existing-code" bash install-yohuman.sh   # reuse a code
 #
-# Requires: jq, curl (curl is built in; install jq with `brew install jq`).
+# Requires: jq, curl (curl is built in; this will set up jq for you).
 set -euo pipefail
 
 YH="$HOME/.yohuman"
 SETTINGS="$HOME/.claude/settings.json"
-NTFY="https://ntfy.sh"
+
+# Public Yo Human backend (publishable key only — browser-safe, RLS-protected).
+PUSH_URL="https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push"
+EVENTS_URL="https://ahfdcubxjcahonmzdoww.supabase.co/rest/v1/events"
+PUB_KEY="sb_publishable_hdgb0arXA-MlSIdTn-aRfQ_vL_XG-g1"
 
 say(){ printf '%s\n' "$*"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { say "❌ '$1' is required but missing."; exit 1; }; }
@@ -35,41 +43,50 @@ ensure_jq(){
 
 say "== Yo Human installer =="
 need curl
-mkdir -p "$YH/approvals" "$HOME/.claude" "$YH/bin"
+mkdir -p "$HOME/.claude" "$YH/bin"
 ensure_jq || { say "❌ Couldn't set up the jq helper automatically. As a last resort, install Homebrew from brew.sh, then run: brew install jq — and run this again."; exit 1; }
 
-# --- 1. Notify channel (your iPhone is subscribed to this in the ntfy app) ---
-NOTIFY="${YH_NOTIFY:-}"
-if [ -z "$NOTIFY" ]; then
-  printf "Your ntfy notify channel (the topic your iPhone is subscribed to): "
-  read -r NOTIFY
-fi
-[ -n "$NOTIFY" ] || { say "❌ A notify channel is required."; exit 1; }
-
-# --- 2. Secret command channel (for two-way approval; auto-generated) ---
-if [ -f "$YH/config.sh" ] && grep -q COMMAND_CHANNEL "$YH/config.sh"; then
+# --- 1. Channel code (this is what you paste into the Yo Human app to pair) ---
+# Reuse the existing channel if this machine was set up before; else use $YH_CHANNEL; else generate one.
+CHANNEL="${YH_CHANNEL:-}"
+if [ -z "$CHANNEL" ] && [ -f "$YH/config.sh" ]; then
   # shellcheck disable=SC1090
-  . "$YH/config.sh"; CMD="${COMMAND_CHANNEL:-}"
+  . "$YH/config.sh" 2>/dev/null || true; CHANNEL="${YH_PUSH_CHANNEL:-}"
 fi
-[ -n "${CMD:-}" ] || CMD="yohuman-cmd-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 16)"
+if [ -z "$CHANNEL" ]; then
+  set +o pipefail
+  CODE="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
+  set -o pipefail
+  [ -n "$CODE" ] || CODE="$(date +%s)$$"
+  CHANNEL="yohuman-$CODE"
+fi
 
+# --- 2. Config (delivery via the native app — Supabase push → APNs) ---
 cat > "$YH/config.sh" <<CONFIG_EOF
-# Yo Human config (this machine)
-NTFY_SERVER="$NTFY"
-NOTIFY_CHANNEL="$NOTIFY"
-COMMAND_CHANNEL="$CMD"
-APPROVALS_DIR="\$HOME/.yohuman/approvals"
-APPROVAL_TIMEOUT=55
+# Yo Human config (this machine). Delivery = Supabase push function → Apple Push → the app.
+APPROVAL_TIMEOUT=60   # seconds Claude waits for your phone tap before falling back to the keyboard
 
 # Anonymous usage telemetry → Supabase (records the event TYPE only; no code, no content).
-SB_EVENTS_URL="https://ahfdcubxjcahonmzdoww.supabase.co/rest/v1/events"
-SB_KEY="sb_publishable_hdgb0arXA-MlSIdTn-aRfQ_vL_XG-g1"
-TELEMETRY_ID="$NOTIFY"
+SB_EVENTS_URL="$EVENTS_URL"
+SB_KEY="$PUB_KEY"
+TELEMETRY_ID="$CHANNEL"
+
+# Native app push. Channel = the code you paste into the Yo Human app.
+YH_PUSH_URL="$PUSH_URL"
+YH_PUSH_CHANNEL="$CHANNEL"
+YH_PUSH_KEY="$PUB_KEY"
+
+# Friendly project names on your alert cards (folder name → what you see). Add lines as you like.
+yh_projname() {
+  case "\$1" in
+    *) echo "\$1" ;;
+  esac
+}
 CONFIG_EOF
 chmod 600 "$YH/config.sh"
 say "✅ config written ($YH/config.sh)"
 
-# --- 2b. Usage event logger (one tiny event TYPE per action; links to this tester) ---
+# --- 2b. Usage event logger (one tiny event TYPE per action; powers your stats screen) ---
 cat > "$YH/yohuman-event.sh" <<'EVENT_EOF'
 #!/bin/bash
 # yohuman-event.sh <type> — log ONE usage event TYPE to Supabase. No code/content. Non-blocking.
@@ -85,144 +102,163 @@ exit 0
 EVENT_EOF
 chmod +x "$YH/yohuman-event.sh"
 
-# --- 3. Approval hook script (default: notify-only; opt-in two-way approval) ---
+# --- 3. Notify script (waiting / finished / error → app push, no buttons) ---
+cat > "$YH/yohuman-push.sh" <<'PUSH_EOF'
+#!/usr/bin/env bash
+# yohuman-push.sh <event> — buzz the Yo Human iOS app via the Supabase push fn.
+# Reads the hook JSON from stdin (for the project name). Respects the mute file.
+[ -f "$HOME/.yohuman/mute" ] && exit 0
+. "$HOME/.yohuman/config.sh" 2>/dev/null
+EVENT="${1:-notify}"
+INPUT="$(cat 2>/dev/null)"
+DIR="$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)"
+PROJ="$(basename "$DIR" 2>/dev/null)"; [ -z "$PROJ" ] && PROJ="your project"
+command -v yh_projname >/dev/null 2>&1 && PROJ="$(yh_projname "$PROJ")"
+case "$EVENT" in
+  idle)  TITLE="Waiting in $PROJ";  BODY="Claude is waiting for your answer";   TELE="";;
+  stop)  TITLE="Finished in $PROJ"; BODY="Claude Code finished — ready for you"; TELE="completion";;
+  error) TITLE="Error in $PROJ";    BODY="Claude hit an error — needs you";      TELE="error";;
+  *)     TITLE="Yo Human";          BODY="Claude needs you";                     TELE="";;
+esac
+[ -n "$TELE" ] && bash "$HOME/.yohuman/yohuman-event.sh" "$TELE" &
+URL="${YH_PUSH_URL:-https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push}"
+CH="${YH_PUSH_CHANNEL:-}"
+KEY="${YH_PUSH_KEY:-}"
+# category "INFO" = no Allow/Reject buttons (those belong only on real two-way approvals).
+PAYLOAD="$(jq -n --arg c "$CH" --arg t "$TITLE" --arg b "$BODY" '{channel:$c,title:$t,body:$b,category:"INFO"}')"
+curl -s -X POST "$URL" -H "Authorization: Bearer $KEY" -H "apikey: $KEY" \
+  -H "Content-Type: application/json" -d "$PAYLOAD" >/dev/null 2>&1 || true
+exit 0
+PUSH_EOF
+chmod +x "$YH/yohuman-push.sh"
+
+# --- 4. Approval hook (default: notify-only; opt-in two-way via Supabase, NO listener) ---
 cat > "$YH/yohuman-approval-hook.sh" <<'HOOK_EOF'
 #!/bin/bash
-# Yo Human PermissionRequest hook. Notify-only unless ~/.yohuman/approve-enabled
-# exists AND the listener is running (then: Allow once / Allow always / Reject).
+# yohuman-approval-hook.sh — Claude Code PermissionRequest hook (Yo Human app, Supabase two-way).
+# DEFAULT (no ~/.yohuman/approve-enabled): notify-only push, normal keyboard approval.
+# ENABLED (approve-enabled present): push with Allow/Reject, WAIT for the phone tap via
+#   Supabase get_decision, return the decision so Claude proceeds. No tap in time → keyboard fallback.
 set -uo pipefail
-. "$HOME/.yohuman/config.sh" 2>/dev/null
+CONFIG="$HOME/.yohuman/config.sh"; [ -f "$CONFIG" ] && . "$CONFIG"
 export PATH="$HOME/.yohuman/bin:$PATH"
+
 input=$(cat)
 tool=$(printf '%s' "$input" | jq -r '.tool_name // "a tool"' 2>/dev/null)
 cwd=$(printf '%s' "$input" | jq -r '.cwd // ""' 2>/dev/null)
-proj=$(basename "$cwd" 2>/dev/null)
-NOTIFY_URL="${NTFY_SERVER:-https://ntfy.sh}/${NOTIFY_CHANNEL:-}"
+proj=$(basename "$cwd" 2>/dev/null); [ -z "$proj" ] && proj="your project"
+command -v yh_projname >/dev/null 2>&1 && proj="$(yh_projname "$proj")"
 case "$tool" in *[Pp]review*|*[Cc]hrome*) exit 0;; esac
-[ -f "$HOME/.yohuman/mute" ] && exit 0   # Do Not Disturb
-bash "$HOME/.yohuman/yohuman-event.sh" approval &   # usage telemetry (non-blocking)
+[ -f "$HOME/.yohuman/mute" ] && exit 0
+bash "$HOME/.yohuman/yohuman-event.sh" approval &
+
+arg=$(printf '%s' "$input" | jq -r '.tool_input.command // .tool_input.file_path // empty' 2>/dev/null | head -1 | cut -c1-120)
+desc=$(printf '%s' "$input" | jq -r '.tool_input.description // .permission_suggestions[0] // empty' 2>/dev/null | head -1 | cut -c1-120)
+# Prefer Claude's own human description (keeps raw commands — and any secrets — off your lock screen).
+if [ -n "$desc" ]; then label="$desc"
+elif [ -n "$arg" ]; then label="$tool — $arg"
+else label="$tool"; fi
+
+URL="${YH_PUSH_URL:-https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push}"
+RPC="${URL%/functions/v1/push}/rest/v1/rpc"
+CH="${YH_PUSH_CHANNEL:-}"
+KEY="${YH_PUSH_KEY:-}"
+
+# ---- QUESTIONS: Claude is asking YOU (often multiple-choice) — NOT an allow/reject. ----
+# Notify only (no buttons), then let the question appear on your Mac to answer.
+case "$tool" in
+  *AskUserQuestion*|*[Qq]uestion*)
+    q=$(printf '%s' "$input" | jq -r '.tool_input.questions[0].question // .tool_input.question // empty' 2>/dev/null | head -1 | cut -c1-160)
+    [ -n "$q" ] || q="Claude Code has a question that needs your answer."
+    jq -n --arg c "$CH" --arg t "Question in $proj" --arg b "$q" \
+      '{channel:$c,title:$t,body:$b,category:"INFO"}' \
+      | curl -s -X POST "$URL" -H "Authorization: Bearer $KEY" -H "apikey: $KEY" -H "Content-Type: application/json" -d @- >/dev/null 2>&1 || true
+    exit 0
+    ;;
+esac
+
+# ---- DEFAULT: notify-only ----
 if [ ! -f "$HOME/.yohuman/approve-enabled" ]; then
-  curl -s -H "Title: Claude Code — $proj" -H "Priority: high" -H "Tags: warning" \
-    -d "🔔 Needs your approval to use $tool in $proj" "$NOTIFY_URL" >/dev/null 2>&1 || true
+  jq -n --arg c "$CH" --arg t "Approve in $proj?" --arg b "$label" \
+    '{channel:$c,title:$t,body:$b,category:"INFO"}' \
+    | curl -s -X POST "$URL" -H "Authorization: Bearer $KEY" -H "apikey: $KEY" -H "Content-Type: application/json" -d @- >/dev/null 2>&1 || true
   exit 0
 fi
-[ -n "${COMMAND_CHANNEL:-}" ] || exit 0
+
+# ---- ENABLED: two-way ----
+REQ="yh-$(date +%s)-$$-${RANDOM}${RANDOM}"
 start=$(date +%s)
-arg=$(printf '%s' "$input" | jq -r '.tool_input.command // .tool_input.file_path // empty' 2>/dev/null | head -1 | cut -c1-90)
-label="$tool"; [ -n "$arg" ] && label="$tool — $arg"
-CMD_URL="${NTFY_SERVER:-https://ntfy.sh}/${COMMAND_CHANNEL}"
-ACTIONS="http, Allow once, ${CMD_URL}, method=POST, body=allowonce, clear=true; http, Allow always, ${CMD_URL}, method=POST, body=allowalways, clear=true; http, Reject, ${CMD_URL}, method=POST, body=reject, clear=true"
-curl -s -H "Title: Approve in ${proj}?" -H "Priority: max" -H "Tags: lock" -H "Actions: ${ACTIONS}" \
-  -d "🔐 Claude wants to use ${label}" "$NOTIFY_URL" >/dev/null 2>&1 || true
-LD="$HOME/.yohuman/last-decision"; deadline=$(( start + ${APPROVAL_TIMEOUT:-55} )); decision=""
+echo "$(date '+%H:%M:%S') [$proj] two-way START REQ=$REQ tool=$tool" >> "$HOME/.yohuman/approval.log"
+jq -n --arg c "$CH" --arg t "Approve in $proj?" --arg b "$label" --arg r "$REQ" \
+  '{channel:$c,title:$t,body:$b,category:"APPROVAL",request_id:$r}' \
+  | curl -s -X POST "$URL" -H "Authorization: Bearer $KEY" -H "apikey: $KEY" -H "Content-Type: application/json" -d @- >/dev/null 2>&1 || true
+
+deadline=$(( start + ${APPROVAL_TIMEOUT:-180} ))
+decision=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  if [ -f "$LD" ]; then d=$(awk '{print $1}' "$LD" 2>/dev/null); t=$(awk '{print $2}' "$LD" 2>/dev/null); if [ -n "$d" ] && [ -n "$t" ] && [ "$t" -ge "$start" ] 2>/dev/null; then decision="$d"; rm -f "$LD"; break; fi; fi
-  sleep 1
+  resp=$(curl -s -X POST "$RPC/get_decision" -H "apikey: $KEY" -H "Authorization: Bearer $KEY" \
+    -H "Content-Type: application/json" -d "{\"p_request_id\":\"$REQ\"}" 2>/dev/null)
+  d=$(printf '%s' "$resp" | tr -d '"[:space:]')
+  case "$d" in allowonce|allowalways|reject) decision="$d"; break;; esac
+  sleep 1.5
 done
+echo "$(date '+%H:%M:%S') [$proj] two-way END REQ=$REQ decision='${decision:-TIMEOUT}'" >> "$HOME/.yohuman/approval.log"
 [ -z "$decision" ] && exit 0
-add_rule(){ local r="$1" f="$HOME/.claude/settings.json" t; t="$(mktemp)"||return 0; if jq --arg r "$r" '.permissions.allow=((.permissions.allow//[])+[$r]|unique)' "$f">"$t" 2>/dev/null; then mv "$t" "$f"; else rm -f "$t"; fi; }
-confirm(){ curl -s -H "Title: Yo Human · $proj" -H "Priority: low" -H "Tags: white_check_mark" -d "$1" "$NOTIFY_URL" >/dev/null 2>&1 || true; }
-tele(){ bash "$HOME/.yohuman/yohuman-event.sh" "$1" & }
+
+add_rule() { local rule="$1" f="$HOME/.claude/settings.json" tmp; tmp="$(mktemp)" || return 0
+  if jq --arg r "$rule" '.permissions.allow = ((.permissions.allow // []) + [$r] | unique)' "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; fi; }
+tele() { bash "$HOME/.yohuman/yohuman-event.sh" "$1" & }
+
 ALLOW='{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
 DENY='{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","reason":"Rejected from phone"}}}'
+
+# No separate confirmation push — the app's in-thread "Thanks, human" already confirms it.
 case "$decision" in
-  allowonce) tele allow_once; confirm "✅ Got it — allowing once: $label. Proceeding."; printf '%s' "$ALLOW";;
-  allowalways) tele allow_always; if [ "$tool" = "Bash" ]; then confirm "✅ Got it — allowing once (Bash stays ask-each-time): $label. Proceeding."; printf '%s' "$ALLOW"; else { [ -n "$arg" ] && add_rule "${tool}(${arg})" || add_rule "$tool"; }; confirm "✅ Got it — allowing always: $label. Won'\''t ask again."; printf '%s' "$ALLOW"; fi;;
-  reject) tele reject; confirm "🚫 Got it — rejected: $label. Stopping."; printf '%s' "$DENY";;
-  *) exit 0;;
+  allowonce)  tele allow_once; printf '%s' "$ALLOW";;
+  allowalways)
+    if [ "$tool" = "Bash" ]; then tele allow_once; printf '%s' "$ALLOW"
+    else { [ -n "$arg" ] && add_rule "${tool}(${arg})" || add_rule "$tool"; }; tele allow_always; printf '%s' "$ALLOW"; fi;;
+  reject) tele reject; printf '%s' "$DENY";;
 esac
 exit 0
 HOOK_EOF
 chmod +x "$YH/yohuman-approval-hook.sh"
 
-# --- 4. Listener script (only needed when two-way approval is enabled) ---
-cat > "$YH/yohuman-approval-listener.sh" <<'LISTENER_EOF'
-#!/bin/bash
-# Yo Human approval listener — records phone taps from the command channel.
-set -uo pipefail
-. "$HOME/.yohuman/config.sh" 2>/dev/null || { echo "no config"; exit 1; }
-export PATH="$HOME/.yohuman/bin:$PATH"
-command -v jq >/dev/null 2>&1 || { echo "jq required"; exit 1; }
-: "${COMMAND_CHANNEL:?command channel not set}"
-NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"; AD="${APPROVALS_DIR:-$HOME/.yohuman/approvals}"
-SF="$HOME/.yohuman/listener.since"; mkdir -p "$AD"; [ -f "$SF" ] || date +%s > "$SF"
-echo "listening → ${NTFY_SERVER}/${COMMAND_CHANNEL}"; B=2
-while true; do
-  S="$(cat "$SF" 2>/dev/null || echo now)"
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    [ "$(printf '%s' "$line" | jq -r '.event // empty' 2>/dev/null)" = "message" ] || continue
-    msg=$(printf '%s' "$line" | jq -r '.message // empty' 2>/dev/null); mt=$(printf '%s' "$line" | jq -r '.time // empty' 2>/dev/null)
-    [ -n "$msg" ] || continue
-    d="$msg"
-    case "$d" in allowonce|allowalways|reject) ;; *) continue;; esac
-    t="${mt:-$(date +%s)}"; case "$t" in ''|*[!0-9]*) t="$(date +%s)";; esac
-    printf '%s %s' "$d" "$t" > "$HOME/.yohuman/last-decision.tmp" && mv "$HOME/.yohuman/last-decision.tmp" "$HOME/.yohuman/last-decision"; echo "$t" > "$SF"; echo "recorded: $d @ $t"; B=2
-  done < <(curl -sN "${NTFY_SERVER}/${COMMAND_CHANNEL}/json?since=${S}" 2>/dev/null)
-  sleep "$B"; B=$(( B<30 ? B*2 : 30 ))
-done
-LISTENER_EOF
-chmod +x "$YH/yohuman-approval-listener.sh"
-
-# --- 4b. Toggle scripts (auto-start listener via launchd while two-way is ON) ---
+# --- 4b. Two-way toggle (just a flag — NO listener/launchd anymore; the hook polls Supabase) ---
 cat > "$YH/yohuman-approve-on.sh" <<'ONSH_EOF'
 #!/bin/bash
-set -euo pipefail
-YH="$HOME/.yohuman"; LA="$HOME/Library/LaunchAgents"; PLIST="$LA/com.yohuman.listener.plist"
-mkdir -p "$LA"
-cat > "$PLIST" <<PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.yohuman.listener</string>
-  <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>$YH/yohuman-approval-listener.sh</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$YH/listener.log</string>
-  <key>StandardErrorPath</key><string>$YH/listener.log</string>
-</dict>
-</plist>
-PLIST_EOF
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load -w "$PLIST"
-touch "$YH/approve-enabled"; sleep 1
-pgrep -f yohuman-approval-listener.sh >/dev/null 2>&1 \
-  && echo "🟢 Two-way phone approval is ON (listener auto-starts at login + restarts on crash)." \
-  || echo "🟡 Enabled, but the listener didn't start. Check $YH/listener.log"
+touch "$HOME/.yohuman/approve-enabled"
+echo "🟢 Two-way phone approval is ON. Approve/Reject right from your phone or watch."
 ONSH_EOF
-chmod +x "$YH/yohuman-approve-on.sh"
-
 cat > "$YH/yohuman-approve-off.sh" <<'OFFSH_EOF'
 #!/bin/bash
-set -euo pipefail
-YH="$HOME/.yohuman"; PLIST="$HOME/Library/LaunchAgents/com.yohuman.listener.plist"
-rm -f "$YH/approve-enabled"
-[ -f "$PLIST" ] && launchctl unload -w "$PLIST" 2>/dev/null || true
-pkill -f yohuman-approval-listener.sh 2>/dev/null || true
-rm -f "$YH/last-decision" 2>/dev/null || true
-echo "⚪ Two-way phone approval is OFF. Back to notify-only; listener stopped."
+rm -f "$HOME/.yohuman/approve-enabled"
+echo "⚪ Two-way OFF — notify-only (approve on the Mac)."
 OFFSH_EOF
-chmod +x "$YH/yohuman-approve-off.sh"
+chmod +x "$YH/yohuman-approve-on.sh" "$YH/yohuman-approve-off.sh"
+
+# Clean up any old ntfy listener from a previous (pre-app) install.
+rm -f "$YH/yohuman-approval-listener.sh" 2>/dev/null || true
+if [ -f "$HOME/Library/LaunchAgents/com.yohuman.listener.plist" ]; then
+  launchctl unload -w "$HOME/Library/LaunchAgents/com.yohuman.listener.plist" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/com.yohuman.listener.plist" 2>/dev/null || true
+fi
+pkill -f yohuman-approval-listener.sh 2>/dev/null || true
 
 say "✅ scripts installed in $YH/"
 
-# --- 5. Merge the global hooks into ~/.claude/settings.json (no clobber) ---
+# --- 5. Merge the global hooks into ~/.claude/settings.json (no clobber of your other settings) ---
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-MUTE="[ -f \"\$HOME/.yohuman/mute\" ] && exit 0; "
-N_CMD="${MUTE}dir=\$(jq -r '.cwd // \"\"'); proj=\$(basename \"\$dir\"); curl -s -H \"Title: Claude Code — \$proj\" -H \"Priority: high\" -H \"Tags: speech_balloon\" -d \"💬 Waiting for your answer in \$proj\" $NTFY/$NOTIFY >/dev/null 2>&1 || true"
-S_CMD="${MUTE}dir=\$(jq -r '.cwd // \"\"'); proj=\$(basename \"\$dir\"); curl -s -H \"Title: Claude Code — \$proj\" -H \"Priority: default\" -H \"Tags: white_check_mark\" -d \"✅ Claude Code finished in \$proj\" $NTFY/$NOTIFY >/dev/null 2>&1 || true; bash \"\$HOME/.yohuman/yohuman-event.sh\" completion &"
-F_CMD="${MUTE}dir=\$(jq -r '.cwd // \"\"'); proj=\$(basename \"\$dir\"); curl -s -H \"Title: Claude Code — \$proj\" -H \"Priority: high\" -H \"Tags: rotating_light\" -d \"⚠️ Error in \$proj\" $NTFY/$NOTIFY >/dev/null 2>&1 || true; bash \"\$HOME/.yohuman/yohuman-event.sh\" error &"
-
 tmp="$(mktemp)"
 jq \
-  --arg pr 'bash "$HOME/.yohuman/yohuman-approval-hook.sh"' \
-  --arg n "$N_CMD" --arg s "$S_CMD" --arg f "$F_CMD" '
+  --arg pr   'bash "$HOME/.yohuman/yohuman-approval-hook.sh"' \
+  --arg idle 'bash "$HOME/.yohuman/yohuman-push.sh" idle' \
+  --arg stop 'bash "$HOME/.yohuman/yohuman-push.sh" stop' \
+  --arg err  'bash "$HOME/.yohuman/yohuman-push.sh" error' '
   .hooks.PermissionRequest = [ { hooks: [ { type:"command", command:$pr, timeout:70 } ] } ]
-  | .hooks.Notification    = [ { matcher:"idle_prompt", hooks: [ { type:"command", command:$n } ] } ]
-  | .hooks.Stop            = [ { hooks: [ { type:"command", command:$s } ] } ]
-  | .hooks.StopFailure     = [ { hooks: [ { type:"command", command:$f } ] } ]
+  | .hooks.Notification    = [ { matcher:"idle_prompt", hooks: [ { type:"command", command:$idle } ] } ]
+  | .hooks.Stop            = [ { hooks: [ { type:"command", command:$stop } ] } ]
+  | .hooks.StopFailure     = [ { hooks: [ { type:"command", command:$err } ] } ]
   | .permissions.allow = ((.permissions.allow // []) + ["Bash(bash ~/.yohuman/yohuman-on.sh)","Bash(bash ~/.yohuman/yohuman-off.sh)"] | unique)
 ' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS" || { rm -f "$tmp"; say "❌ failed to update $SETTINGS"; exit 1; }
 say "✅ global hooks installed in $SETTINGS"
@@ -230,15 +266,20 @@ say "✅ global hooks installed in $SETTINGS"
 # --- 5b. On/off toggle scripts + natural-language control ("Yo Human, I'm away") ---
 cat > "$YH/yohuman-on.sh" <<'ON2_EOF'
 #!/bin/bash
+# Notifications ON (unmute) + a confirmation buzz so you KNOW it's live.
 rm -f "$HOME/.yohuman/mute"
 . "$HOME/.yohuman/config.sh" 2>/dev/null
-curl -s -H "Title: Yo Human" -H "Tags: bell" -d "🔔 You're on — I'll buzz you the moment Claude needs you." "${NTFY_SERVER:-https://ntfy.sh}/${NOTIFY_CHANNEL}" >/dev/null 2>&1 || true
-echo "🔔 Yo Human is ON — your phone will buzz when Claude needs you."
+URL="${YH_PUSH_URL:-https://ahfdcubxjcahonmzdoww.supabase.co/functions/v1/push}"
+CH="${YH_PUSH_CHANNEL:-}"; KEY="${YH_PUSH_KEY:-}"
+jq -n --arg c "$CH" --arg b "You're on — I'll buzz you the moment Claude needs you." \
+  '{channel:$c,title:"Yo Human",body:$b,category:"INFO"}' \
+  | curl -s -X POST "$URL" -H "Authorization: Bearer $KEY" -H "apikey: $KEY" -H "Content-Type: application/json" -d @- >/dev/null 2>&1 || true
+echo "🔔 Yo Human is ON — your phone will buzz when Claude needs you. (Check your phone for the confirmation.)"
 ON2_EOF
 cat > "$YH/yohuman-off.sh" <<'OFF2_EOF'
 #!/bin/bash
 touch "$HOME/.yohuman/mute"
-echo "🔕 Yo Human is OFF — muted while you work."
+echo "🔕 Yo Human is OFF — muted while you work. Say \"Yo Human, I'm away\" to turn it back on."
 OFF2_EOF
 chmod +x "$YH/yohuman-on.sh" "$YH/yohuman-off.sh"
 
@@ -259,11 +300,16 @@ fi
 # --- 6. Record the install (one event), then done ---
 bash "$YH/yohuman-event.sh" install >/dev/null 2>&1 || true
 say ""
-say "🎉 Done. RESTART Claude Code, then every project on this Mac will notify your iPhone."
-say "   Notify channel: $NOTIFY   (make sure the ntfy app on your phone is subscribed to it)"
+say "🎉 Done. RESTART Claude Code, then every project on this Mac buzzes your iPhone."
+say ""
+say "📲 PAIR YOUR PHONE — paste this channel code into the Yo Human app:"
+say ""
+say "        $CHANNEL"
+say ""
+say "   (Yo Human app → Add/Pair → paste the code. Get the app from TestFlight / the App Store.)"
 say ""
 say "Optional — two-way phone approval (Allow once / always / Reject):"
-say "   turn ON:   bash ~/.yohuman/yohuman-approve-on.sh    (listener auto-starts at login)"
+say "   turn ON:   bash ~/.yohuman/yohuman-approve-on.sh"
 say "   turn OFF:  bash ~/.yohuman/yohuman-approve-off.sh"
 say ""
 say "Control it by just TALKING to Claude Code (any project):"
